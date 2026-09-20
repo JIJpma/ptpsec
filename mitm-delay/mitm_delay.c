@@ -456,17 +456,24 @@ lcore_main(void)
 					pcap_capture_pkt(bufs[p]);
 
 					/* Validation only: compare the HW-latched RX timestamp
-					 * (if any) against find_ptp()'s own confirmed classification. */
-					if (hwts_ok[in]) {
+					 * (if any) against find_ptp()'s own confirmed classification.
+					 * i40e has 4 RX timestamp slots (one per event msg type); the
+					 * driver records which one this packet landed in on the mbuf
+					 * itself, valid only when RTE_MBUF_F_RX_IEEE1588_TMST is set. */
+					if (hwts_ok[in] && (bufs[p]->ol_flags & RTE_MBUF_F_RX_IEEE1588_TMST)) {
 						struct timespec hw_ts;
-						int hw_ret = rte_eth_timesync_read_rx_timestamp(in, &hw_ts, 0);
+						int hw_ret = rte_eth_timesync_read_rx_timestamp(
+								in, &hw_ts, bufs[p]->timesync);
 						if (hw_ret == 0)
-							printf("[hwts] port %u mtype=%u  HW RX ts = %ld.%09ld\n",
-							       in, ptp->msg_type & 0x0F,
+							printf("[hwts] port %u mtype=%u slot=%u  HW RX ts = %ld.%09ld\n",
+							       in, ptp->msg_type & 0x0F, bufs[p]->timesync,
 							       (long)hw_ts.tv_sec, (long)hw_ts.tv_nsec);
 						else
-							printf("[hwts] port %u mtype=%u  HW RX ts unavailable (ret=%d)\n",
-							       in, ptp->msg_type & 0x0F, hw_ret);
+							printf("[hwts] port %u mtype=%u slot=%u  HW RX ts unavailable (ret=%d)\n",
+							       in, ptp->msg_type & 0x0F, bufs[p]->timesync, hw_ret);
+					} else if (hwts_ok[in]) {
+						printf("[hwts] port %u mtype=%u  no HW timestamp flag on this mbuf\n",
+						       in, ptp->msg_type & 0x0F);
 					}
 				}
 
