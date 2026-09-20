@@ -52,6 +52,21 @@ Start with no attack, then launch:
 echo 0 > delay.txt && sudo ./build/mitm-delay -l 0 -n 4
 ```
 
+## PTP capture
+
+Since both ports are owned by DPDK while the tool runs, they're invisible to
+`tcpdump` directly. Every frame classified as PTP (from either port, in
+arrival order) is therefore also appended to `ptp_capture.pcap` in the
+working directory, in standard pcap format:
+
+```bash
+tcpdump -r ptp_capture.pcap
+```
+
+or open it in Wireshark. Useful for confirming PTP is actually reaching a
+port, or for eyeballing message rates/profile, without needing switch
+mirroring or rebinding a port back to the kernel.
+
 ## Attack control (live, no restart)
 
 Write microseconds to `delay.txt`. The **sign selects the direction**:

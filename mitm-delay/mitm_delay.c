@@ -37,6 +37,7 @@
 #include <inttypes.h>
 #include <stdio.h>
 #include <signal.h>
+#include <time.h>
 
 #include <rte_eal.h>
 #include <rte_errno.h>
@@ -93,6 +94,7 @@ static volatile bool force_quit = false;
 static int64_t  g_delay_us = 0;   /* current attack delay, signed microseconds */
 static uint64_t tsc_hz;
 static uint16_t g_ports[NUM_PORTS];
+static bool     hwts_ok[NUM_PORTS];   /* per-port: did rte_eth_timesync_enable() succeed? */
 
 /* Previous stats snapshot per port, for delta (rate) computation. */
 struct port_stat_prev {
@@ -180,6 +182,12 @@ port_init(uint16_t port, struct rte_mempool *mbuf_pool)
 		return retval;
 	}
 
+	/* Best-effort HW PTP timestamping, to validate against the TSC path.
+	 * Not fatal if unsupported -- the tool still works on TSC alone. */
+	hwts_ok[port] = (rte_eth_timesync_enable(port) == 0);
+	if (!hwts_ok[port])
+		printf("port %u: HW timestamping unavailable, using TSC only\n", port);
+
 	struct rte_ether_addr addr;
 	rte_eth_macaddr_get(port, &addr);
 	printf("Port %u up  MAC %02x:%02x:%02x:%02x:%02x:%02x  (mtu %u)\n",
@@ -251,15 +259,11 @@ find_ptp(struct rte_mbuf *m)
 
 /* How long (in TSC cycles) this packet must be held. 0 = forward now. */
 static inline uint64_t
-attack_hold_cycles(struct rte_mbuf *m)
+attack_hold_cycles(const struct ptp_hdr *ptp)
 {
 	int64_t d = g_delay_us;
-	/* Fast path: no active attack, skip PTP classification entirely. */
-	if (d == 0)
-		return 0;
-
-	struct ptp_hdr *ptp = find_ptp(m);
-	if (ptp == NULL)
+	/* Fast path: no active attack, or not a PTP event message. */
+	if (d == 0 || ptp == NULL)
 		return 0;
 
 	uint8_t mtype = ptp->msg_type & 0x0F;
@@ -296,6 +300,84 @@ drain_hold(uint64_t now)
 		}
 	}
 	hold_count = w;
+}
+
+/*
+ * Minimal pcap writer for offline inspection: every PTP frame classified by
+ * find_ptp() gets appended here, from both ports, in arrival order. Read it
+ * with `tcpdump -r ptp_capture.pcap` or Wireshark -- useful since the two
+ * DPDK-owned ports are otherwise invisible to tcpdump directly.
+ */
+#define PCAP_SNAPLEN 256
+
+struct __attribute__((__packed__)) pcap_global_hdr {
+	uint32_t magic_number;
+	uint16_t version_major;
+	uint16_t version_minor;
+	int32_t  thiszone;
+	uint32_t sigfigs;
+	uint32_t snaplen;
+	uint32_t network;
+};
+
+struct __attribute__((__packed__)) pcap_rec_hdr {
+	uint32_t ts_sec;
+	uint32_t ts_usec;
+	uint32_t incl_len;
+	uint32_t orig_len;
+};
+
+static FILE *ptp_pcap_f = NULL;
+
+static void
+pcap_capture_open(const char *path)
+{
+	ptp_pcap_f = fopen(path, "wb");
+	if (ptp_pcap_f == NULL) {
+		printf("PTP capture: could not open %s, capture disabled\n", path);
+		return;
+	}
+
+	/* Classic (non-ng) pcap global header -- widely supported, trivial to write. */
+	struct pcap_global_hdr hdr = {
+		.magic_number  = 0xa1b2c3d4,
+		.version_major = 2,
+		.version_minor = 4,
+		.thiszone      = 0,
+		.sigfigs       = 0,
+		.snaplen       = PCAP_SNAPLEN,
+		.network       = 1, /* LINKTYPE_ETHERNET */
+	};
+	fwrite(&hdr, sizeof(hdr), 1, ptp_pcap_f);
+	fflush(ptp_pcap_f);
+}
+
+/* Append one PTP frame to the capture file, truncated to PCAP_SNAPLEN. */
+static inline void
+pcap_capture_pkt(struct rte_mbuf *m)
+{
+	if (ptp_pcap_f == NULL)
+		return;
+
+	uint32_t orig_len = rte_pktmbuf_data_len(m);
+	uint32_t cap_len = orig_len < PCAP_SNAPLEN ? orig_len : PCAP_SNAPLEN;
+
+	/* Wall-clock time, not TSC -- pcap readers expect epoch-based timestamps. */
+	struct timespec ts;
+	clock_gettime(CLOCK_REALTIME, &ts);
+
+	struct pcap_rec_hdr rec = {
+		.ts_sec   = (uint32_t)ts.tv_sec,
+		.ts_usec  = (uint32_t)(ts.tv_nsec / 1000),
+		.incl_len = cap_len,
+		.orig_len = orig_len,
+	};
+	fwrite(&rec, sizeof(rec), 1, ptp_pcap_f);
+	fwrite(rte_pktmbuf_mtod(m, void *), 1, cap_len, ptp_pcap_f);
+	/* PTP's own rate is low enough that flushing every packet is cheap, and it
+	 * keeps the file readable live (e.g. `tail -f` a `tcpdump -r` won't work,
+	 * but re-opening the file mid-capture will see up-to-date data). */
+	fflush(ptp_pcap_f);
 }
 
 /*
@@ -369,7 +451,26 @@ lcore_main(void)
 
 			/* Forward now, queue for delayed release, or fail open if full. */
 			for (uint16_t p = 0; p < nb_rx; p++) {
-				uint64_t hc = attack_hold_cycles(bufs[p]);
+				struct ptp_hdr *ptp = find_ptp(bufs[p]);
+				if (ptp != NULL) {
+					pcap_capture_pkt(bufs[p]);
+
+					/* Validation only: compare the HW-latched RX timestamp
+					 * (if any) against find_ptp()'s own confirmed classification. */
+					if (hwts_ok[in]) {
+						struct timespec hw_ts;
+						int hw_ret = rte_eth_timesync_read_rx_timestamp(in, &hw_ts, 0);
+						if (hw_ret == 0)
+							printf("[hwts] port %u mtype=%u  HW RX ts = %ld.%09ld\n",
+							       in, ptp->msg_type & 0x0F,
+							       (long)hw_ts.tv_sec, (long)hw_ts.tv_nsec);
+						else
+							printf("[hwts] port %u mtype=%u  HW RX ts unavailable (ret=%d)\n",
+							       in, ptp->msg_type & 0x0F, hw_ret);
+					}
+				}
+
+				uint64_t hc = attack_hold_cycles(ptp);
 				if (hc == 0) {
 					tx_one(out, bufs[p]);
 				} else if (hold_count < HOLD_MAX) {
@@ -474,8 +575,14 @@ main(int argc, char *argv[])
 		fclose(f);
 	}
 
+	/* Every classified PTP frame also gets appended here for offline inspection. */
+	pcap_capture_open("./ptp_capture.pcap");
+
 	/* Run the forwarding loop until Ctrl+C / SIGTERM sets force_quit. */
 	lcore_main();
+
+	if (ptp_pcap_f != NULL)
+		fclose(ptp_pcap_f);
 
 	/* Tear down both ports and release DPDK resources. */
 	printf("Cleaning up...\n");
